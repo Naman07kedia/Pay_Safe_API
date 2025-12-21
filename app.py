@@ -8,7 +8,7 @@ import os
 # Config and file paths
 # -------------------------------
 MODELS_DIR = "Models"
-DASHBOARDS_DIR = "Dashboards"
+DASHBOARDS_DIR = "Dashboard"
 DATA_DIR = "Data"
 
 METRICS_PATH = os.path.join(MODELS_DIR, "metrics_summary.csv")
