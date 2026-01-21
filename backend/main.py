@@ -1,100 +1,105 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import joblib
-import pandas as pd
-import numpy as np
 import os
+import requests
+import pandas as pd
+import joblib
+from io import StringIO, BytesIO
+from fastapi import FastAPI
 
-# ---------- FastAPI App ----------
 app = FastAPI(title="PaySafe UPI Fraud Detection API")
 
-# ---------- Enable CORS ----------
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],   # In production, restrict to your frontend domain
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# -----------------------------
+# Utility functions
+# -----------------------------
+def load_csv_from_drive(file_id: str) -> pd.DataFrame:
+    """Download a CSV from Google Drive using file ID."""
+    url = f"https://drive.google.com/uc?id={file_id}"
+    response = requests.get(url)
+    response.raise_for_status()
+    return pd.read_csv(StringIO(response.text))
 
-# ---------- Paths ----------
-MODEL_DIR = "models"
-DASHBOARD_DIR = "dashboard"
+def load_model_from_drive(file_id: str):
+    """Download a serialized model (joblib) from Google Drive using file ID."""
+    url = f"https://drive.google.com/uc?id={file_id}"
+    response = requests.get(url)
+    response.raise_for_status()
+    return joblib.load(BytesIO(response.content))
 
-# ---------- Load Artifacts ----------
-scaler = joblib.load(os.path.join(MODEL_DIR, "scaler.joblib"))
-xgb_model = joblib.load(os.path.join(MODEL_DIR, "xgb_model.joblib"))
+# -----------------------------
+# Load datasets and models
+# -----------------------------
+cleaned_data = load_csv_from_drive(os.getenv("CLEANED_DATA_ID"))
+metrics_summary = load_csv_from_drive(os.getenv("METRICS_SUMMARY_ID"))
 
-# ---------- Request Schema ----------
-class Transaction(BaseModel):
-    transaction_id: str
-    amount: float
-    upi_id: str
-    timestamp: str
+scaler = load_model_from_drive(os.getenv("SCALER_ID"))
+isolation_forest = load_model_from_drive(os.getenv("ISOLATION_FOREST_ID"))
+xgb_model = load_model_from_drive(os.getenv("XGB_MODEL_ID"))
 
-# ---------- Root ----------
+shap_transaction_values = load_csv_from_drive(os.getenv("SHAP_TRANSACTION_VALUES_ID"))
+shap_feature_importance_bp = load_csv_from_drive(os.getenv("SHAP_FEATURE_IMPORTANCE_BP_ID"))
+hybrid_eval_test = load_csv_from_drive(os.getenv("HYBRID_EVAL_TEST_ID"))
+shap_fraud_vs_non_fraud = load_csv_from_drive(os.getenv("SHAP_FRAUD_VS_NON_FRAUD_ID"))
+
+# -----------------------------
+# API Endpoints
+# -----------------------------
 @app.get("/")
 def root():
-    return {"message": "Welcome to PaySafe Fraud Detection API"}
+    return {"message": "PaySafe UPI Fraud Detection API is running!"}
 
-# ---------- Prediction Endpoint ----------
+@app.get("/preview")
+def preview(rows: int = 5):
+    """Preview first N rows of cleaned dataset."""
+    return cleaned_data.head(rows).to_dict(orient="records")
+
+@app.get("/metrics")
+def get_metrics():
+    """Return metrics summary dataset."""
+    return metrics_summary.to_dict(orient="records")
+
+@app.get("/shap/importance")
+def shap_importance(rows: int = 10):
+    """Return SHAP feature importance values."""
+    return shap_feature_importance_bp.head(rows).to_dict(orient="records")
+
+@app.get("/shap/transactions")
+def shap_transactions(rows: int = 10):
+    """Return SHAP transaction values."""
+    return shap_transaction_values.head(rows).to_dict(orient="records")
+
+@app.get("/shap/fraud_vs_nonfraud")
+def shap_fraud(rows: int = 10):
+    """Return SHAP fraud vs non-fraud breakdown."""
+    return shap_fraud_vs_non_fraud.head(rows).to_dict(orient="records")
+
+@app.get("/hybrid_eval")
+def hybrid_eval(rows: int = 10):
+    """Return hybrid evaluation test results."""
+    return hybrid_eval_test.head(rows).to_dict(orient="records")
+
+# -----------------------------
+# Example prediction endpoint
+# -----------------------------
 @app.post("/predict")
-def predict(transaction: Transaction):
+def predict(features: dict):
     """
-    Accepts transaction details and returns fraud prediction.
+    Run fraud detection prediction using XGBoost model.
+    Expects JSON with feature values.
     """
-    # Convert input into DataFrame
-    input_data = pd.DataFrame([{
-        "transaction_id": transaction.transaction_id,
-        "amount": transaction.amount,
-        "upi_id": transaction.upi_id,
-        "timestamp": transaction.timestamp
-    }])
+    import numpy as np
 
-    # --- Preprocessing ---
-    # Example: use only numeric features (adjust to your training pipeline)
-    numeric_features = ["amount"]
-    X = input_data[numeric_features].values
+    # Convert input dict to DataFrame
+    X = pd.DataFrame([features])
 
-    # Scale
+    # Scale features
     X_scaled = scaler.transform(X)
 
-    # Predict
-    prediction = xgb_model.predict(X_scaled)[0]
-    probability = xgb_model.predict_proba(X_scaled)[0][1]
+    # Isolation Forest anomaly score
+    anomaly_score = isolation_forest.decision_function(X_scaled)
+
+    # XGBoost prediction
+    prediction = xgb_model.predict(X_scaled)
 
     return {
-        "transaction_id": transaction.transaction_id,
-        "fraud_prediction": int(prediction),
-        "fraud_probability": round(float(probability), 3)
+        "prediction": int(prediction[0]),
+        "anomaly_score": float(anomaly_score[0])
     }
-
-# ---------- SHAP Feature Importance Endpoint ----------
-@app.get("/shap/importance")
-def shap_importance():
-    """
-    Returns SHAP feature importance from CSV.
-    """
-    shap_csv = os.path.join(MODEL_DIR, "shap_feature_importance_bp.csv")
-    df = pd.read_csv(shap_csv)
-    return df.to_dict(orient="records")
-
-# ---------- Dashboard Data Endpoints ----------
-@app.get("/dashboard/fraud_vs_nonfraud")
-def fraud_vs_nonfraud():
-    """
-    Returns SHAP fraud vs non-fraud summary.
-    """
-    csv_path = os.path.join(DASHBOARD_DIR, "shap_fraud_vs_non_fraud.csv")
-    df = pd.read_csv(csv_path)
-    return df.to_dict(orient="records")
-
-@app.get("/dashboard/transaction_values")
-def transaction_values():
-    """
-    Returns SHAP transaction values summary.
-    """
-    csv_path = os.path.join(DASHBOARD_DIR, "shap_transaction_values.csv")
-    df = pd.read_csv(csv_path)
-    return df.to_dict(orient="records")
